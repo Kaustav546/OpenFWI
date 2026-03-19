@@ -40,8 +40,9 @@ import transforms as T
 
 step = 0
 
-def train_one_epoch(model, criterion, optimizer, lr_scheduler, 
-                    dataloader, device, epoch, print_freq, writer):
+def train_one_epoch(model, criterion, optimizer, lr_scheduler,
+                    dataloader, device, epoch, print_freq, writer,
+                    scaler=None, grad_clip=0.0, grad_accum_steps=1):
     global step
     model.train()
 
@@ -51,28 +52,49 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler,
     metric_logger.add_meter('samples/s', utils.SmoothedValue(window_size=10, fmt='{value:.3f}'))
     header = 'Epoch: [{}]'.format(epoch)
 
-    for data, label in metric_logger.log_every(dataloader, print_freq, header):
+    optimizer.zero_grad()
+    for batch_idx, (data, label) in enumerate(metric_logger.log_every(dataloader, print_freq, header)):
         start_time = time.time()
-        optimizer.zero_grad()
         data, label = data.to(device), label.to(device)
-        output = model(data)
-        loss, loss_g1v, loss_g2v = criterion(output, label)
-        loss.backward()
-        optimizer.step()
+
+        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+            output = model(data)
+            loss, loss_g1v, loss_g2v = criterion(output, label)
+            # Scale loss for gradient accumulation
+            loss_accum = loss / grad_accum_steps
+
+        if scaler is not None:
+            scaler.scale(loss_accum).backward()
+        else:
+            loss_accum.backward()
+
+        is_update_step = (batch_idx + 1) % grad_accum_steps == 0
+
+        if is_update_step:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad()
+            lr_scheduler.step()
+            step += 1
 
         loss_val = loss.item()
         loss_g1v_val = loss_g1v.item()
         loss_g2v_val = loss_g2v.item()
         batch_size = data.shape[0]
-        metric_logger.update(loss=loss_val, loss_g1v=loss_g1v_val, 
+        metric_logger.update(loss=loss_val, loss_g1v=loss_g1v_val,
             loss_g2v=loss_g2v_val, lr=optimizer.param_groups[0]['lr'])
         metric_logger.meters['samples/s'].update(batch_size / (time.time() - start_time))
         if writer:
             writer.add_scalar('loss', loss_val, step)
             writer.add_scalar('loss_g1v', loss_g1v_val, step)
             writer.add_scalar('loss_g2v', loss_g2v_val, step)
-        step += 1
-        lr_scheduler.step()
 
 
 def evaluate(model, criterion, dataloader, device, writer):
@@ -190,8 +212,16 @@ def main(args):
     if args.model not in network.model_dict:
         print('Unsupported model.')
         sys.exit()
-    model = network.model_dict[args.model](upsample_mode=args.up_mode, 
-        sample_spatial=args.sample_spatial, sample_temporal=args.sample_temporal).to(device)
+    model = network.model_dict[args.model](
+        upsample_mode=args.up_mode,
+        sample_spatial=args.sample_spatial,
+        sample_temporal=args.sample_temporal,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        mlp_ratio=args.mlp_ratio,
+        dropout=args.vit_dropout,
+    ).to(device)
 
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -216,6 +246,10 @@ def main(args):
         optimizer, milestones=lr_milestones, gamma=args.lr_gamma,
         warmup_iters=warmup_iters, warmup_factor=1e-5)
 
+    # Mixed-precision scaler (only on CUDA)
+    use_amp = args.use_amp and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
     model_without_ddp = model
     if args.distributed:
         model = DistributedDataParallel(model, device_ids=[args.local_rank])
@@ -233,12 +267,16 @@ def main(args):
     print('Start training')
     start_time = time.time()
     best_loss = 10
-    chp=1 
+    best_epoch = 1
+    epochs_no_improve = 0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, lr_scheduler, dataloader_train,
-                        device, epoch, args.print_freq, train_writer)
+                        device, epoch, args.print_freq, train_writer,
+                        scaler=scaler,
+                        grad_clip=args.grad_clip,
+                        grad_accum_steps=args.grad_accum_steps)
         
         loss = evaluate(model, criterion, dataloader_valid, device, val_writer)
         
@@ -255,15 +293,22 @@ def main(args):
             checkpoint,
             os.path.join(args.output_path, 'checkpoint.pth'))
             print('saving checkpoint at epoch: ', epoch)
-            chp = epoch
+            best_epoch = epoch
             best_loss = loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
         # Save checkpoint every epoch block
         print('current best loss: ', best_loss)
-        print('current best epoch: ', chp)
+        print('current best epoch: ', best_epoch)
         if args.output_path and (epoch + 1) % args.epoch_block == 0:
             utils.save_on_master(
                 checkpoint,
                 os.path.join(args.output_path, 'model_{}.pth'.format(epoch + 1)))
+        # Early stopping
+        if args.early_stopping_patience > 0 and epochs_no_improve >= args.early_stopping_patience:
+            print(f'Early stopping triggered after {epochs_no_improve} epochs without improvement.')
+            break
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -291,6 +336,14 @@ def parse_args():
     parser.add_argument('-um', '--up-mode', default=None, help='upsampling layer mode such as "nearest", "bicubic", etc.')
     parser.add_argument('-ss', '--sample-spatial', type=float, default=1.0, help='spatial sampling ratio')
     parser.add_argument('-st', '--sample-temporal', type=int, default=1, help='temporal sampling ratio')
+
+    # ViT architecture hyperparameters
+    parser.add_argument('--embed-dim', default=512, type=int, help='SeismicViT embedding dimension')
+    parser.add_argument('--num-heads', default=8, type=int, help='SeismicViT number of attention heads')
+    parser.add_argument('--num-layers', default=6, type=int, help='SeismicViT number of transformer layers')
+    parser.add_argument('--mlp-ratio', default=4.0, type=float, help='SeismicViT MLP expansion ratio')
+    parser.add_argument('--vit-dropout', default=0.1, type=float, help='SeismicViT dropout rate')
+
     # Training related
     parser.add_argument('-b', '--batch-size', default=256, type=int)
     parser.add_argument('--lr', default=0.0001, type=float, help='initial learning rate')
@@ -306,6 +359,16 @@ def parse_args():
     parser.add_argument('--print-freq', default=50, type=int, help='print frequency')
     parser.add_argument('-r', '--resume', default=None, help='resume from checkpoint')
     parser.add_argument('--start-epoch', default=0, type=int, help='start epoch')
+
+    # Convergence improvements
+    parser.add_argument('--grad-clip', default=1.0, type=float,
+                        help='max gradient norm for clipping (0 to disable)')
+    parser.add_argument('--grad-accum-steps', default=1, type=int,
+                        help='number of steps to accumulate gradients before updating')
+    parser.add_argument('--use-amp', action='store_true',
+                        help='enable automatic mixed-precision training (CUDA only)')
+    parser.add_argument('--early-stopping-patience', default=0, type=int,
+                        help='stop training if val loss does not improve for this many epochs (0 to disable)')
 
     # Loss related
     parser.add_argument('-g1v', '--lambda_g1v', type=float, default=1.0)

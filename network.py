@@ -313,9 +313,193 @@ class Deconv_HPGNN(nn.Module):
         return self.layers(x)
 
 
+class TransformerBlock(nn.Module):
+    """Transformer encoder block with pre-norm for improved stability."""
+
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        mlp_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(normed, normed, normed)
+        x = x + self.drop(attn_out)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class SeismicViT(nn.Module):
+    """Vision Transformer based architecture for seismic FWI.
+
+    Input:  (bs, 5, 1000, 70) – seismic data
+    Output: (bs, 1, 70,   70) – velocity model
+
+    Architecture:
+    1. CNN stem – progressive temporal then joint spatial+temporal compression
+       with spectral normalisation and GroupNorm for training stability.
+    2. Flatten feature map to token sequence.
+    3. Learnable positional embeddings + Transformer encoder.
+    4. Bilinear-upsample decoder with skip connections from the encoder.
+    """
+
+    def __init__(self, dim1=32, dim2=64, dim3=128, dim4=256, embed_dim=512,
+                 num_heads=8, num_layers=6, mlp_ratio=4.0, dropout=0.1,
+                 sample_spatial=1.0, **kwargs):
+        super().__init__()
+
+        # ── CNN Encoder ──────────────────────────────────────────────────
+        # Stages 1-4: temporal-only compression ((k,1) kernels, stride (2,1))
+        self.enc1 = self._conv_block(5,    dim1, (7, 1), (2, 1), (3, 0))  # (bs,  32, 500, 70)
+        self.enc2 = self._conv_block(dim1, dim2, (3, 1), (2, 1), (1, 0))  # (bs,  64, 250, 70)
+        self.enc3 = self._conv_block(dim2, dim2, (3, 1), (2, 1), (1, 0))  # (bs,  64, 125, 70)
+        self.enc4 = self._conv_block(dim2, dim3, (3, 1), (2, 1), (1, 0))  # (bs, 128,  63, 70)
+        # Stages 5-7: joint spatial+temporal compression (3×3 kernels, stride 2)
+        self.enc5 = self._conv_block(dim3, dim3, 3, 2, 1)                  # (bs, 128,  32, 35)
+        self.enc6 = self._conv_block(dim3, dim4, 3, 2, 1)                  # (bs, 256,  16, 18)
+        self.enc7 = self._conv_block(dim4, embed_dim, 3, 2, 1)             # (bs, 512,   8,  9)
+
+        self._h_tokens = 8
+        self._w_tokens = 9
+        num_tokens = self._h_tokens * self._w_tokens  # 72
+
+        # ── Positional embeddings ─────────────────────────────────────────
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # ── Transformer encoder ───────────────────────────────────────────
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(num_layers)
+        ])
+        self.transformer_norm = nn.LayerNorm(embed_dim)
+
+        # ── Decoder with skip connections ─────────────────────────────────
+        # dec1: (512, 8, 9) → upsample (16,18) → cat skip from enc6 → (256, 16, 18)
+        self.dec1_proj = nn.Conv2d(embed_dim, dim4, 1)
+        self.dec1_up   = nn.Upsample(size=(16, 18), mode='bilinear', align_corners=False)
+        self.dec1_conv = self._dec_block(dim4 + dim4, dim4)
+
+        # dec2: (256,16,18) → upsample (35,35) → cat skip from enc5 → (128, 35, 35)
+        self.dec2_proj = nn.Conv2d(dim4, dim3, 1)
+        self.dec2_up   = nn.Upsample(size=(35, 35), mode='bilinear', align_corners=False)
+        self.dec2_conv = self._dec_block(dim3 + dim3, dim3)
+
+        # dec3: (128,35,35) → upsample (70,70) → (64, 70, 70)
+        self.dec3_proj = nn.Conv2d(dim3, dim2, 1)
+        self.dec3_up   = nn.Upsample(size=(70, 70), mode='bilinear', align_corners=False)
+        self.dec3_conv = self._dec_block(dim2, dim2)
+
+        # Final: (64,70,70) → (1,70,70)
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(dim2, dim2 // 2, 3, padding=1),
+            nn.GroupNorm(self._num_groups(dim2 // 2), dim2 // 2),
+            nn.GELU(),
+            nn.Conv2d(dim2 // 2, 1, 1),
+            nn.Tanh(),
+        )
+
+        self._init_weights()
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _num_groups(channels, max_groups=8):
+        """Return a valid num_groups for GroupNorm(channels)."""
+        g = max_groups
+        while g > 1 and channels % g != 0:
+            g //= 2
+        return g
+
+    def _conv_block(self, in_ch, out_ch, kernel, stride, pad):
+        """Conv2d (spectral-normed) + GroupNorm + GELU."""
+        conv = nn.Conv2d(in_ch, out_ch, kernel, stride, pad)
+        nn.init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
+        if conv.bias is not None:
+            nn.init.zeros_(conv.bias)
+        return nn.Sequential(
+            nn.utils.spectral_norm(conv),
+            nn.GroupNorm(self._num_groups(out_ch), out_ch),
+            nn.GELU(),
+        )
+
+    def _dec_block(self, in_ch, out_ch):
+        """Double-conv decoder block with GroupNorm + GELU."""
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.GroupNorm(self._num_groups(out_ch), out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.GroupNorm(self._num_groups(out_ch), out_ch),
+            nn.GELU(),
+        )
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    # ── Forward ───────────────────────────────────────────────────────────
+
+    def forward(self, x):
+        # Encode (save skips from enc5 and enc6)
+        x = self.enc1(x)   # (bs,  32, 500, 70)
+        x = self.enc2(x)   # (bs,  64, 250, 70)
+        x = self.enc3(x)   # (bs,  64, 125, 70)
+        x = self.enc4(x)   # (bs, 128,  63, 70)
+        s5 = self.enc5(x)  # (bs, 128,  32, 35)  ← skip 1
+        s6 = self.enc6(s5) # (bs, 256,  16, 18)  ← skip 2
+        z  = self.enc7(s6) # (bs, 512,   8,  9)
+
+        # Tokenise: (bs, 512, 8, 9) → (bs, 72, 512)
+        bs, C, H, W = z.shape
+        tokens = z.flatten(2).permute(0, 2, 1) + self.pos_embed
+
+        # Transformer
+        for block in self.transformer_blocks:
+            tokens = block(tokens)
+        tokens = self.transformer_norm(tokens)
+
+        # Reshape back: (bs, 72, 512) → (bs, 512, 8, 9)
+        z = tokens.permute(0, 2, 1).reshape(bs, C, H, W)
+
+        # Decode with skip connections
+        d1 = self.dec1_up(self.dec1_proj(z))              # (bs, 256, 16, 18)
+        d1 = torch.cat([d1, s6], dim=1)                   # (bs, 512, 16, 18)
+        d1 = self.dec1_conv(d1)                            # (bs, 256, 16, 18)
+
+        d2 = self.dec2_up(self.dec2_proj(d1))             # (bs, 128, 35, 35)
+        s5_resized = F.interpolate(s5, size=(35, 35), mode='bilinear', align_corners=False)
+        d2 = torch.cat([d2, s5_resized], dim=1)                  # (bs, 256, 35, 35)
+        d2 = self.dec2_conv(d2)                            # (bs, 128, 35, 35)
+
+        d3 = self.dec3_up(self.dec3_proj(d2))             # (bs,  64, 70, 70)
+        d3 = self.dec3_conv(d3)                            # (bs,  64, 70, 70)
+
+        return self.out_conv(d3)                           # (bs,   1, 70, 70)
+
+
 model_dict = {
     'InversionNet': InversionNet,
     'Discriminator': Discriminator,
-    'UPFWI': FCN4_Deep_Resize_2
+    'UPFWI': FCN4_Deep_Resize_2,
+    'SeismicViT': SeismicViT,
 }
 

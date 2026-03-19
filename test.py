@@ -96,6 +96,10 @@ def evaluate(model, criterions, dataloader, device, k, ctx,
     print(f'MSE: {l2(label_t, pred_t)}')
     ssim_loss = pytorch_ssim.SSIM(window_size=11)
     print(f'SSIM: {ssim_loss(label_t / 2 + 0.5, pred_t / 2 + 0.5)}') # (-1, 1) to (0, 1)
+    mse_val = l2(label_t, pred_t).item()
+    # Normalized labels live in [-1, 1], so the data range is 2.0
+    psnr = 10 * torch.log10(torch.tensor(4.0 / mse_val)) if mse_val > 0 else float('inf')
+    print(f'PSNR: {psnr:.4f} dB')
 
     for name, criterion in criterions.items():
         print(f' * Velocity {name}: {criterion(label, label_pred)}')
@@ -158,9 +162,18 @@ def main(args):
     if args.model not in network.model_dict:
         print('Unsupported model.')
         sys.exit()
-     
-    model = network.model_dict[args.model](upsample_mode=args.up_mode, 
-        sample_spatial=args.sample_spatial, sample_temporal=args.sample_temporal, norm=args.norm).to(device)
+      
+    model = network.model_dict[args.model](
+        upsample_mode=args.up_mode,
+        sample_spatial=args.sample_spatial,
+        sample_temporal=args.sample_temporal,
+        norm=args.norm,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        mlp_ratio=args.mlp_ratio,
+        dropout=args.vit_dropout,
+    ).to(device)
 
     criterions = {
         'MAE': lambda x, y: np.mean(np.abs(x - y)),
@@ -210,6 +223,13 @@ def parse_args():
     parser.add_argument('-um', '--up-mode', default=None, help='upsampling layer mode such as "nearest", "bicubic", etc.')
     parser.add_argument('-ss', '--sample-spatial', type=float, default=1.0, help='spatial sampling ratio')
     parser.add_argument('-st', '--sample-temporal', type=int, default=1, help='temporal sampling ratio')
+
+    # ViT architecture hyperparameters (must match training config)
+    parser.add_argument('--embed-dim', default=512, type=int, help='SeismicViT embedding dimension')
+    parser.add_argument('--num-heads', default=8, type=int, help='SeismicViT number of attention heads')
+    parser.add_argument('--num-layers', default=6, type=int, help='SeismicViT number of transformer layers')
+    parser.add_argument('--mlp-ratio', default=4.0, type=float, help='SeismicViT MLP expansion ratio')
+    parser.add_argument('--vit-dropout', default=0.1, type=float, help='SeismicViT dropout rate')
 
     # Test related
     parser.add_argument('-b', '--batch-size', default=50, type=int)
