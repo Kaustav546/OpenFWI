@@ -52,6 +52,21 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler,
     metric_logger.add_meter('samples/s', utils.SmoothedValue(window_size=10, fmt='{value:.3f}'))
     header = 'Epoch: [{}]'.format(epoch)
 
+    def _optimizer_step():
+        """Unscale, clip, step, zero_grad, advance scheduler."""
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
+        lr_scheduler.step()
+
+    has_pending_grads = False
     optimizer.zero_grad()
     for batch_idx, (data, label) in enumerate(metric_logger.log_every(dataloader, print_freq, header)):
         start_time = time.time()
@@ -67,21 +82,11 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler,
             scaler.scale(loss_accum).backward()
         else:
             loss_accum.backward()
+        has_pending_grads = True
 
-        is_update_step = (batch_idx + 1) % grad_accum_steps == 0
-
-        if is_update_step:
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad()
-            lr_scheduler.step()
+        if (batch_idx + 1) % grad_accum_steps == 0:
+            _optimizer_step()
+            has_pending_grads = False
             step += 1
 
         loss_val = loss.item()
@@ -95,6 +100,11 @@ def train_one_epoch(model, criterion, optimizer, lr_scheduler,
             writer.add_scalar('loss', loss_val, step)
             writer.add_scalar('loss_g1v', loss_g1v_val, step)
             writer.add_scalar('loss_g2v', loss_g2v_val, step)
+
+    # Flush any remaining accumulated gradients from the last incomplete window.
+    if has_pending_grads:
+        _optimizer_step()
+        step += 1
 
 
 def evaluate(model, criterion, dataloader, device, writer):
@@ -201,12 +211,14 @@ def main(args):
     dataloader_train = DataLoader(
         dataset_train, batch_size=args.batch_size,
         sampler=train_sampler, num_workers=args.workers,
-        pin_memory=True, drop_last=True, collate_fn=default_collate)
+        pin_memory=True, drop_last=True, collate_fn=default_collate,
+        persistent_workers=args.workers > 0)
 
     dataloader_valid = DataLoader(
         dataset_valid, batch_size=args.batch_size,
         sampler=valid_sampler, num_workers=args.workers,
-        pin_memory=True, collate_fn=default_collate)
+        pin_memory=True, collate_fn=default_collate,
+        persistent_workers=args.workers > 0)
 
     print('Creating model')
     if args.model not in network.model_dict:
@@ -354,7 +366,7 @@ def parse_args():
     parser.add_argument('--lr-warmup-epochs', default=0, type=int, help='number of warmup epochs')   
     parser.add_argument('-eb', '--epoch_block', type=int, default=40, help='epochs in a saved block')
     parser.add_argument('-nb', '--num_block', type=int, default=3, help='number of saved block')
-    parser.add_argument('-j', '--workers', default=16, type=int, help='number of data loading workers (default: 16)')
+    parser.add_argument('-j', '--workers', default=4, type=int, help='number of data loading workers (default: 4; preloaded datasets benefit from a small value)')
     parser.add_argument('--k', default=1, type=float, help='k in log transformation')
     parser.add_argument('--print-freq', default=50, type=int, help='print frequency')
     parser.add_argument('-r', '--resume', default=None, help='resume from checkpoint')

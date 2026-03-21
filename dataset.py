@@ -18,6 +18,7 @@
 
 import os
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
 import transforms as T
@@ -33,6 +34,11 @@ class FWIDataset(Dataset):
         sample_ratio: downsample ratio for seismic data
         file_size: # of samples in each npy file
         transform_data|label: transformation applied to data or label
+
+    When preload=True the transforms are applied once at init time and the
+    results are stored as PyTorch tensors in shared memory.  This means
+    DataLoader workers only need to index into already-computed shared
+    memory – no redundant per-sample CPU transforms and no IPC copies.
     '''
     def __init__(self, anno, preload=True, sample_ratio=1, file_size=500,
                     transform_data=None, transform_label=None):
@@ -49,9 +55,25 @@ class FWIDataset(Dataset):
             self.data_list, self.label_list = [], []
             for batch in self.batches: 
                 data, label = self.load_every(batch)
-                self.data_list.append(data)
+                # Apply transforms once here so workers never recompute them.
+                if self.transform_data:
+                    buf = np.empty_like(data)
+                    for i in range(len(data)):
+                        buf[i] = self.transform_data(data[i])
+                    data = buf
+                if self.transform_label and label is not None:
+                    lbuf = np.empty_like(label)
+                    for i in range(len(label)):
+                        lbuf[i] = self.transform_label(label[i])
+                    label = lbuf
+                # Store as shared-memory tensors so workers can read without IPC copies.
+                self.data_list.append(
+                    torch.from_numpy(np.ascontiguousarray(data)).share_memory_()
+                )
                 if label is not None:
-                    self.label_list.append(label)
+                    self.label_list.append(
+                        torch.from_numpy(np.ascontiguousarray(label)).share_memory_()
+                    )
 
     # Load from one line
     def load_every(self, batch):
@@ -73,10 +95,12 @@ class FWIDataset(Dataset):
         if self.preload:
             data = self.data_list[batch_idx][sample_idx]
             label = self.label_list[batch_idx][sample_idx] if len(self.label_list) != 0 else None
-        else:
-            data, label = self.load_every(self.batches[batch_idx])
-            data = data[sample_idx]
-            label = label[sample_idx] if label is not None else None
+            # Transforms were already applied at init time; return directly.
+            return data, label if label is not None else np.array([])
+        # Non-preload path: load from disk and apply transforms per sample.
+        data, label = self.load_every(self.batches[batch_idx])
+        data = data[sample_idx]
+        label = label[sample_idx] if label is not None else None
         if self.transform_data:
             data = self.transform_data(data)
         if self.transform_label and label is not None:

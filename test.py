@@ -156,7 +156,8 @@ def main(args):
     dataloader_valid = torch.utils.data.DataLoader(
         dataset_valid, batch_size=args.batch_size,
         sampler=valid_sampler, num_workers=args.workers,
-        pin_memory=True, collate_fn=default_collate)
+        pin_memory=True, collate_fn=default_collate,
+        persistent_workers=args.workers > 0)
 
     print("Creating model")
     if args.model not in network.model_dict:
@@ -233,7 +234,7 @@ def parse_args():
 
     # Test related
     parser.add_argument('-b', '--batch-size', default=50, type=int)
-    parser.add_argument('-j', '--workers', default=16, type=int, help='number of data loading workers (default: 16)')
+    parser.add_argument('-j', '--workers', default=4, type=int, help='number of data loading workers (default: 4; preloaded datasets benefit from a small value)')
     parser.add_argument('--k', default=1, type=float, help='k in log transformation')
     parser.add_argument('-r', '--resume', default=None, help='resume from checkpoint')
     parser.add_argument('--vis', help='visualization option', action="store_true")
