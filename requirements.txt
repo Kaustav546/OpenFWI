@@ -1,0 +1,7 @@
+numpy
+torch
+torchvision
+psutil
+tqdm
+scikit-learn
+scikit-image

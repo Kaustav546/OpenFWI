@@ -19,94 +19,148 @@
 import os
 import numpy as np
 import torch
+import psutil
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
+from tqdm import tqdm
 import transforms as T
+
 
 class FWIDataset(Dataset):
     ''' FWI dataset
-    For convenience, in this class, a batch refers to a npy file 
+    For convenience, in this class, a batch refers to a npy file
     instead of the batch used during training.
 
     Args:
-        anno: path to annotation file
-        preload: whether to load the whole dataset into memory
-        sample_ratio: downsample ratio for seismic data
-        file_size: # of samples in each npy file
-        transform_data|label: transformation applied to data or label
+        anno:             path to annotation file
+        preload:          whether to preload batches into memory at init time
+        sample_ratio:     downsample ratio for seismic data
+        file_size:        number of samples in each npy file
+        transform_data:   transformation applied to seismic data
+        transform_label:  transformation applied to velocity labels
+        memory_limit:     maximum RAM usage percentage before preloading stops
+                          (default 90).  Batches that didn't fit at init time
+                          are loaded on demand and the oldest cached batch is
+                          evicted when memory is tight.
 
-    When preload=True the transforms are applied once at init time and the
-    results are stored as PyTorch tensors in shared memory.  This means
-    DataLoader workers only need to index into already-computed shared
-    memory – no redundant per-sample CPU transforms and no IPC copies.
+    Performance notes
+    -----------------
+    Transforms are applied **once** inside ``_load_chunk`` (not per sample
+    inside ``__getitem__``).  Loaded batches are stored as PyTorch
+    shared-memory tensors so that DataLoader workers can read them via a
+    direct pointer rather than copying data through IPC pipes.
     '''
+
     def __init__(self, anno, preload=True, sample_ratio=1, file_size=500,
-                    transform_data=None, transform_label=None):
+                 transform_data=None, transform_label=None, memory_limit=90):
         if not os.path.exists(anno):
-            print(f'Annotation file {anno} does not exists')
+            raise FileNotFoundError(f'Annotation file {anno} not found.')
         self.preload = preload
         self.sample_ratio = sample_ratio
         self.file_size = file_size
         self.transform_data = transform_data
         self.transform_label = transform_label
+        self.memory_limit = memory_limit
         with open(anno, 'r') as f:
-            self.batches = f.readlines()
-        if preload: 
-            self.data_list, self.label_list = [], []
-            for batch in self.batches: 
-                data, label = self.load_every(batch)
-                # Apply transforms once here so workers never recompute them.
-                if self.transform_data:
-                    buf = np.empty_like(data)
-                    for i in range(len(data)):
-                        buf[i] = self.transform_data(data[i])
-                    data = buf
-                if self.transform_label and label is not None:
-                    lbuf = np.empty_like(label)
-                    for i in range(len(label)):
-                        lbuf[i] = self.transform_label(label[i])
-                    label = lbuf
-                # Store as shared-memory tensors so workers can read without IPC copies.
-                self.data_list.append(
-                    torch.from_numpy(np.ascontiguousarray(data)).share_memory_()
-                )
-                if label is not None:
-                    self.label_list.append(
-                        torch.from_numpy(np.ascontiguousarray(label)).share_memory_()
-                    )
+            self.batches = [line.strip() for line in f if line.strip()]
 
-    # Load from one line
-    def load_every(self, batch):
-        batch = batch.split('\t')
-        data_path = batch[0] if len(batch) > 1 else batch[0][:-1]
-        data = np.load(data_path)[:, :, ::self.sample_ratio, :]
-        data = data.astype('float32')
-        if len(batch) > 1:
-            label_path = batch[1][:-1]    
-            label = np.load(label_path)
-            label = label.astype('float32')
-        else:
-            label = None
-        
-        return data, label
-        
-    def __getitem__(self, idx):
-        batch_idx, sample_idx = idx // self.file_size, idx % self.file_size
-        if self.preload:
-            data = self.data_list[batch_idx][sample_idx]
-            label = self.label_list[batch_idx][sample_idx] if len(self.label_list) != 0 else None
-            # Transforms were already applied at init time; return directly.
-            return data, label if label is not None else np.array([])
-        # Non-preload path: load from disk and apply transforms per sample.
-        data, label = self.load_every(self.batches[batch_idx])
-        data = data[sample_idx]
-        label = label[sample_idx] if label is not None else None
+        # LRU cache: batch_idx -> shared-memory tensor (transforms already applied)
+        self.cache_data = {}
+        self.cache_label = {}
+        self.cache_order = []   # insertion-ordered list for LRU eviction
+
+        # preload_complete guards against accessing data before init finishes.
+        # For preload=False there is nothing to wait for, so it is True immediately.
+        self.preload_complete = not preload
+        if preload:
+            self._preload_until_limit()
+            self.preload_complete = True
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_mem_usage(self):
+        '''Return current RAM usage as a percentage (0-100).'''
+        return psutil.virtual_memory().percent
+
+    def _load_chunk(self, batch_idx):
+        '''Load one .npy batch from disk, apply transforms once, and return as
+        shared-memory PyTorch tensors.  Transforms are applied here so that
+        DataLoader workers never need to recompute them.'''
+        batch_line = self.batches[batch_idx]
+        parts = [p.strip() for p in batch_line.split('\t')]
+        data = np.load(parts[0])[:, :, ::self.sample_ratio, :].astype('float32')
+        label = np.load(parts[1]).astype('float32') if len(parts) > 1 else None
+
+        # Apply transforms once per chunk load – O(file_size) not O(epochs * file_size).
         if self.transform_data:
-            data = self.transform_data(data)
+            buf = np.empty_like(data)
+            for i in range(len(data)):
+                buf[i] = self.transform_data(data[i])
+            data = buf
         if self.transform_label and label is not None:
-            label = self.transform_label(label)
+            lbuf = np.empty_like(label)
+            for i in range(len(label)):
+                lbuf[i] = self.transform_label(label[i])
+            label = lbuf
+
+        # Convert to shared-memory tensors: workers read via pointer, no IPC copy.
+        data_t = torch.from_numpy(np.ascontiguousarray(data)).share_memory_()
+        label_t = (torch.from_numpy(np.ascontiguousarray(label)).share_memory_()
+                   if label is not None else None)
+        return data_t, label_t
+
+    def _preload_until_limit(self):
+        '''Preload batches sequentially until RAM usage reaches
+        ``memory_limit * 0.95`` percent.'''
+        for i in tqdm(range(len(self.batches)), desc='Preloading batches'):
+            if self._get_mem_usage() >= self.memory_limit * 0.95:
+                break
+            if i not in self.cache_data:
+                data_t, label_t = self._load_chunk(i)
+                self.cache_data[i] = data_t
+                if label_t is not None:
+                    self.cache_label[i] = label_t
+                self.cache_order.append(i)
+
+    def _unload_oldest(self):
+        '''Evict the oldest cached batch to free memory.'''
+        if not self.cache_order:
+            return
+        oldest = self.cache_order.pop(0)
+        del self.cache_data[oldest]
+        if oldest in self.cache_label:
+            del self.cache_label[oldest]
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, idx):
+        if not self.preload_complete:
+            raise RuntimeError('Attempted to access data before preload is complete.')
+        batch_idx, sample_idx = idx // self.file_size, idx % self.file_size
+
+        if batch_idx not in self.cache_data:
+            # Evict oldest batches until memory is below threshold, then load.
+            # We keep at least one batch in cache to guarantee progress even
+            # when a single batch is larger than the available headroom.
+            while (self._get_mem_usage() >= self.memory_limit * 0.95
+                   and len(self.cache_order) > 1):
+                self._unload_oldest()
+            data_t, label_t = self._load_chunk(batch_idx)
+            self.cache_data[batch_idx] = data_t
+            if label_t is not None:
+                self.cache_label[batch_idx] = label_t
+            self.cache_order.append(batch_idx)
+
+        # Transforms were already applied in _load_chunk; return directly.
+        data = self.cache_data[batch_idx][sample_idx]
+        label = (self.cache_label[batch_idx][sample_idx]
+                 if batch_idx in self.cache_label else None)
         return data, label if label is not None else np.array([])
-        
+
     def __len__(self):
         return len(self.batches) * self.file_size
 
@@ -119,7 +173,8 @@ if __name__ == '__main__':
     transform_label = Compose([
         T.MinMaxNormalize(2000, 6000)
     ])
-    dataset = FWIDataset(f'relevant_files/temp.txt', transform_data=transform_data, transform_label=transform_label, file_size=1)
+    dataset = FWIDataset('relevant_files/temp.txt', transform_data=transform_data,
+                         transform_label=transform_label, file_size=1)
     data, label = dataset[0]
     print(data.shape)
     print(label is None)
