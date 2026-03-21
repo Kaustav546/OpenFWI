@@ -16,14 +16,18 @@
 
 # others to do so.
 
+import logging
 import os
 import numpy as np
 import torch
 import psutil
+import warnings
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
 from tqdm import tqdm
 import transforms as T
+
+logger = logging.getLogger(__name__)
 
 
 class FWIDataset(Dataset):
@@ -41,7 +45,11 @@ class FWIDataset(Dataset):
         memory_limit:     maximum RAM usage percentage before preloading stops
                           (default 90).  Batches that didn't fit at init time
                           are loaded on demand and the oldest cached batch is
-                          evicted when memory is tight.
+                          evicted when memory is tight.  Even if a single
+                          batch is larger than the remaining headroom, the
+                          eviction loop is guaranteed to exit because the
+                          dataset always keeps at least one batch resident in
+                          the cache (see ``__getitem__`` for details).
 
     Performance notes
     -----------------
@@ -68,6 +76,9 @@ class FWIDataset(Dataset):
         self.cache_data = {}
         self.cache_label = {}
         self.cache_order = []   # insertion-ordered list for LRU eviction
+        # Suppress duplicate ResourceWarning for oversized batches (emitted at
+        # most once per dataset instance, not once per cache miss).
+        self._large_batch_warned = False
 
         # preload_complete guards against accessing data before init finishes.
         # For preload=False there is nothing to wait for, so it is True immediately.
@@ -143,12 +154,44 @@ class FWIDataset(Dataset):
         batch_idx, sample_idx = idx // self.file_size, idx % self.file_size
 
         if batch_idx not in self.cache_data:
-            # Evict oldest batches until memory is below threshold, then load.
-            # We keep at least one batch in cache to guarantee progress even
-            # when a single batch is larger than the available headroom.
+            # Evict the oldest cached batches until RAM usage drops below the
+            # threshold, then load the required batch.
+            #
+            # Why "len(self.cache_order) > 1"?
+            # ─────────────────────────────────
+            # If a single .npy batch file occupies more RAM than the available
+            # headroom (i.e. memory usage stays above `memory_limit * 0.95`
+            # even after evicting everything), the while-loop condition would
+            # never become False on its own.  That is a livelock: the loop
+            # would spin forever calling `_unload_oldest`, which becomes a
+            # no-op once the cache is empty.
+            #
+            # The `> 1` guard breaks the cycle: once only one batch remains
+            # in the cache the loop exits unconditionally, letting `_load_chunk`
+            # run.  Training continues — the memory limit is temporarily
+            # exceeded for that one large batch — but it never deadlocks.
             while (self._get_mem_usage() >= self.memory_limit * 0.95
                    and len(self.cache_order) > 1):
                 self._unload_oldest()
+            # Warn when the limit could not be satisfied (batch larger than
+            # available headroom).  This is expected behaviour; it is logged
+            # so that operators can tune `memory_limit` if needed.
+            # The warning is emitted at most once per dataset instance to avoid
+            # flooding the logs during long training runs.
+            if (not self._large_batch_warned
+                    and self._get_mem_usage() >= self.memory_limit * 0.95
+                    and len(self.cache_order) <= 1):
+                warnings.warn(
+                    f'Memory usage ({self._get_mem_usage():.1f}%) is still '
+                    f'above the {self.memory_limit * 0.95:.1f}% threshold '
+                    f'after evicting all but one cached batch.  The batch at '
+                    f'index {batch_idx} is likely larger than the available '
+                    f'headroom.  Consider increasing `memory_limit` or '
+                    f'reducing `file_size`.  Training continues.',
+                    ResourceWarning,
+                    stacklevel=2,
+                )
+                self._large_batch_warned = True
             data_t, label_t = self._load_chunk(batch_idx)
             self.cache_data[batch_idx] = data_t
             if label_t is not None:
