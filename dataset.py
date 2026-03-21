@@ -16,73 +16,283 @@
 
 # others to do so.
 
+import logging
 import os
+import shutil
 import numpy as np
+import torch
+import psutil
+import warnings
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
+from tqdm import tqdm
 import transforms as T
+
+logger = logging.getLogger(__name__)
+
+# Path to the POSIX shared-memory filesystem used by torch.share_memory_().
+# On macOS and Windows this path does not exist; helpers that reference it
+# degrade gracefully.
+_SHM_PATH = '/dev/shm'
+
+# Preloading stops when free space in /dev/shm falls below this fraction of
+# its total capacity.  The 10 % margin ensures that the last batch written
+# to shared memory can be faulted in without triggering SIGBUS.
+_SHM_MIN_FREE_FRACTION = 0.10
+
 
 class FWIDataset(Dataset):
     ''' FWI dataset
-    For convenience, in this class, a batch refers to a npy file 
+    For convenience, in this class, a batch refers to a npy file
     instead of the batch used during training.
 
     Args:
-        anno: path to annotation file
-        preload: whether to load the whole dataset into memory
-        sample_ratio: downsample ratio for seismic data
-        file_size: # of samples in each npy file
-        transform_data|label: transformation applied to data or label
+        anno:             path to annotation file
+        preload:          whether to preload batches into memory at init time
+        sample_ratio:     downsample ratio for seismic data
+        file_size:        number of samples in each npy file
+        transform_data:   transformation applied to seismic data
+        transform_label:  transformation applied to velocity labels
+        memory_limit:     maximum RAM usage percentage before preloading stops
+                          (default 90).  Batches that didn't fit at init time
+                          are loaded on demand and the oldest cached batch is
+                          evicted when memory is tight.  Even if a single
+                          batch is larger than the remaining headroom, the
+                          eviction loop is guaranteed to exit because the
+                          dataset always keeps at least one batch resident in
+                          the cache (see ``__getitem__`` for details).
+
+    Performance notes
+    -----------------
+    Transforms are applied **once** inside ``_load_chunk`` (not per sample
+    inside ``__getitem__``).  Where space permits, loaded batches are stored
+    as PyTorch shared-memory tensors so that DataLoader workers can read them
+    via a direct pointer rather than copying data through IPC pipes.
+
+    SIGBUS / shared-memory safety
+    ------------------------------
+    On Linux, ``torch.Tensor.share_memory_()`` backs tensor storage with a
+    file inside ``/dev/shm`` (a ``tmpfs`` whose size is typically capped at
+    ~50 % of total RAM).  If ``/dev/shm`` fills up and the kernel then tries
+    to fault a page into that ``mmap`` region it delivers **SIGBUS** — a
+    fatal signal that cannot be caught in Python.  To prevent this,
+    ``_to_shared_tensor`` checks free space in ``/dev/shm`` *before* calling
+    ``share_memory_()`` and silently falls back to ordinary process memory
+    when space is insufficient.  ``_preload_until_limit`` stops preloading
+    before ``/dev/shm`` approaches exhaustion for the same reason.
     '''
+
     def __init__(self, anno, preload=True, sample_ratio=1, file_size=500,
-                    transform_data=None, transform_label=None):
+                 transform_data=None, transform_label=None, memory_limit=90):
         if not os.path.exists(anno):
-            print(f'Annotation file {anno} does not exists')
+            raise FileNotFoundError(f'Annotation file {anno} not found.')
         self.preload = preload
         self.sample_ratio = sample_ratio
         self.file_size = file_size
         self.transform_data = transform_data
         self.transform_label = transform_label
+        self.memory_limit = memory_limit
         with open(anno, 'r') as f:
-            self.batches = f.readlines()
-        if preload: 
-            self.data_list, self.label_list = [], []
-            for batch in self.batches: 
-                data, label = self.load_every(batch)
-                self.data_list.append(data)
-                if label is not None:
-                    self.label_list.append(label)
+            self.batches = [line.strip() for line in f if line.strip()]
 
-    # Load from one line
-    def load_every(self, batch):
-        batch = batch.split('\t')
-        data_path = batch[0] if len(batch) > 1 else batch[0][:-1]
-        data = np.load(data_path)[:, :, ::self.sample_ratio, :]
-        data = data.astype('float32')
-        if len(batch) > 1:
-            label_path = batch[1][:-1]    
-            label = np.load(label_path)
-            label = label.astype('float32')
-        else:
-            label = None
-        
-        return data, label
-        
-    def __getitem__(self, idx):
-        batch_idx, sample_idx = idx // self.file_size, idx % self.file_size
-        if self.preload:
-            data = self.data_list[batch_idx][sample_idx]
-            label = self.label_list[batch_idx][sample_idx] if len(self.label_list) != 0 else None
-        else:
-            data, label = self.load_every(self.batches[batch_idx])
-            data = data[sample_idx]
-            label = label[sample_idx] if label is not None else None
+        # LRU cache: batch_idx -> shared-memory tensor (transforms already applied)
+        self.cache_data = {}
+        self.cache_label = {}
+        self.cache_order = []   # insertion-ordered list for LRU eviction
+        # Suppress duplicate ResourceWarning for oversized batches (emitted at
+        # most once per dataset instance, not once per cache miss).
+        self._large_batch_warned = False
+
+        # preload_complete guards against accessing data before init finishes.
+        # For preload=False there is nothing to wait for, so it is True immediately.
+        self.preload_complete = not preload
+        if preload:
+            self._preload_until_limit()
+            self.preload_complete = True
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_mem_usage(self):
+        '''Return current RAM usage as a percentage (0-100).'''
+        return psutil.virtual_memory().percent
+
+    def _shm_free_bytes(self):
+        '''Return the number of free bytes in the POSIX shared-memory
+        filesystem (``/dev/shm``).
+
+        Returns ``float('inf')`` when ``/dev/shm`` does not exist (macOS,
+        Windows) so that callers treat shared memory as effectively unlimited
+        on those platforms.
+        '''
+        try:
+            return shutil.disk_usage(_SHM_PATH).free
+        except OSError:
+            return float('inf')
+
+    def _to_shared_tensor(self, arr):
+        '''Convert *arr* (a NumPy array) to a contiguous PyTorch tensor and
+        attempt to move it into POSIX shared memory for zero-copy DataLoader
+        worker access.
+
+        The move is skipped when ``/dev/shm`` does not have enough free space
+        for the tensor.  This is the primary defence against **SIGBUS**: on
+        Linux, writing to a ``tmpfs``-backed ``mmap`` region (i.e. shared
+        memory) when the filesystem is full causes the kernel to deliver
+        SIGBUS — a fatal signal that cannot be caught in Python.  By checking
+        free space *before* the call we ensure the tensor either lands safely
+        in shared memory or stays in ordinary process memory.
+        '''
+        t = torch.from_numpy(np.ascontiguousarray(arr))
+        try:
+            if self._shm_free_bytes() >= t.nbytes:
+                t.share_memory_()
+        except Exception:
+            # Defensive catch: if share_memory_() raises for any other reason
+            # (e.g. RLIMIT_MEMLOCK, permission error) we continue with a
+            # regular tensor rather than crashing.
+            pass
+        return t
+
+    def _load_chunk(self, batch_idx):
+        '''Load one .npy batch from disk, apply transforms once, and return as
+        PyTorch tensors.  Where ``/dev/shm`` has sufficient free space the
+        tensors are placed in shared memory so that DataLoader workers can read
+        them via a direct pointer; otherwise ordinary process memory is used to
+        prevent SIGBUS (see ``_to_shared_tensor``).'''
+        batch_line = self.batches[batch_idx]
+        parts = [p.strip() for p in batch_line.split('\t')]
+        data = np.load(parts[0])[:, :, ::self.sample_ratio, :].astype('float32')
+        label = np.load(parts[1]).astype('float32') if len(parts) > 1 else None
+
+        # Apply transforms once per chunk load – O(file_size) not O(epochs * file_size).
         if self.transform_data:
-            data = self.transform_data(data)
+            buf = np.empty_like(data)
+            for i in range(len(data)):
+                buf[i] = self.transform_data(data[i])
+            data = buf
         if self.transform_label and label is not None:
-            label = self.transform_label(label)
+            lbuf = np.empty_like(label)
+            for i in range(len(label)):
+                lbuf[i] = self.transform_label(label[i])
+            label = lbuf
+
+        # Use shared memory only when /dev/shm has room; fall back to regular
+        # tensors to prevent SIGBUS when the shared-memory tmpfs is full.
+        data_t = self._to_shared_tensor(data)
+        label_t = self._to_shared_tensor(label) if label is not None else None
+        return data_t, label_t
+
+    def _preload_until_limit(self):
+        '''Preload batches sequentially until either:
+
+        * RAM usage reaches ``memory_limit * 0.95`` percent, or
+        * ``/dev/shm`` free space drops below ``_SHM_MIN_FREE_FRACTION`` of
+          its total capacity (default 10 %).
+
+        The second condition prevents SIGBUS: if ``/dev/shm`` fills up while
+        ``_to_shared_tensor`` is copying a batch there, the kernel may deliver
+        SIGBUS before Python can react.  Stopping preload early keeps a safe
+        margin.  Batches that were not preloaded are loaded on demand by
+        ``__getitem__`` using the same guarded ``_to_shared_tensor`` path.
+        '''
+        try:
+            shm_stat = shutil.disk_usage(_SHM_PATH)
+            shm_total = shm_stat.total
+        except OSError:
+            shm_total = 0  # /dev/shm absent (macOS / Windows) – skip that check
+
+        for i in tqdm(range(len(self.batches)), desc='Preloading batches'):
+            if self._get_mem_usage() >= self.memory_limit * 0.95:
+                break
+            # Guard against /dev/shm exhaustion: stop when free space falls
+            # below _SHM_MIN_FREE_FRACTION of total capacity.  This leaves
+            # headroom for the batches already cached plus whatever the OS needs.
+            if shm_total > 0 and self._shm_free_bytes() < shm_total * _SHM_MIN_FREE_FRACTION:
+                logger.warning(
+                    '/dev/shm is nearly full — stopping preload at batch '
+                    '%d/%d to prevent SIGBUS.  The remaining batches will be '
+                    'loaded on demand.',
+                    i, len(self.batches),
+                )
+                break
+            if i not in self.cache_data:
+                data_t, label_t = self._load_chunk(i)
+                self.cache_data[i] = data_t
+                if label_t is not None:
+                    self.cache_label[i] = label_t
+                self.cache_order.append(i)
+
+    def _unload_oldest(self):
+        '''Evict the oldest cached batch to free memory.'''
+        if not self.cache_order:
+            return
+        oldest = self.cache_order.pop(0)
+        del self.cache_data[oldest]
+        if oldest in self.cache_label:
+            del self.cache_label[oldest]
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, idx):
+        if not self.preload_complete:
+            raise RuntimeError('Attempted to access data before preload is complete.')
+        batch_idx, sample_idx = idx // self.file_size, idx % self.file_size
+
+        if batch_idx not in self.cache_data:
+            # Evict the oldest cached batches until RAM usage drops below the
+            # threshold, then load the required batch.
+            #
+            # Why "len(self.cache_order) > 1"?
+            # ─────────────────────────────────
+            # If a single .npy batch file occupies more RAM than the available
+            # headroom (i.e. memory usage stays above `memory_limit * 0.95`
+            # even after evicting everything), the while-loop condition would
+            # never become False on its own.  That is a livelock: the loop
+            # would spin forever calling `_unload_oldest`, which becomes a
+            # no-op once the cache is empty.
+            #
+            # The `> 1` guard breaks the cycle: once only one batch remains
+            # in the cache the loop exits unconditionally, letting `_load_chunk`
+            # run.  Training continues — the memory limit is temporarily
+            # exceeded for that one large batch — but it never deadlocks.
+            while (self._get_mem_usage() >= self.memory_limit * 0.95
+                   and len(self.cache_order) > 1):
+                self._unload_oldest()
+            # Warn when the limit could not be satisfied (batch larger than
+            # available headroom).  This is expected behaviour; it is logged
+            # so that operators can tune `memory_limit` if needed.
+            # The warning is emitted at most once per dataset instance to avoid
+            # flooding the logs during long training runs.
+            if (not self._large_batch_warned
+                    and self._get_mem_usage() >= self.memory_limit * 0.95
+                    and len(self.cache_order) <= 1):
+                warnings.warn(
+                    f'Memory usage ({self._get_mem_usage():.1f}%) is still '
+                    f'above the {self.memory_limit * 0.95:.1f}% threshold '
+                    f'after evicting all but one cached batch.  The batch at '
+                    f'index {batch_idx} is likely larger than the available '
+                    f'headroom.  Consider increasing `memory_limit` or '
+                    f'reducing `file_size`.  Training continues.',
+                    ResourceWarning,
+                    stacklevel=2,
+                )
+                self._large_batch_warned = True
+            data_t, label_t = self._load_chunk(batch_idx)
+            self.cache_data[batch_idx] = data_t
+            if label_t is not None:
+                self.cache_label[batch_idx] = label_t
+            self.cache_order.append(batch_idx)
+
+        # Transforms were already applied in _load_chunk; return directly.
+        data = self.cache_data[batch_idx][sample_idx]
+        label = (self.cache_label[batch_idx][sample_idx]
+                 if batch_idx in self.cache_label else None)
         return data, label if label is not None else np.array([])
-        
+
     def __len__(self):
         return len(self.batches) * self.file_size
 
@@ -95,7 +305,8 @@ if __name__ == '__main__':
     transform_label = Compose([
         T.MinMaxNormalize(2000, 6000)
     ])
-    dataset = FWIDataset(f'relevant_files/temp.txt', transform_data=transform_data, transform_label=transform_label, file_size=1)
+    dataset = FWIDataset('relevant_files/temp.txt', transform_data=transform_data,
+                         transform_label=transform_label, file_size=1)
     data, label = dataset[0]
     print(data.shape)
     print(label is None)
