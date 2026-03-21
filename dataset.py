@@ -18,6 +18,7 @@
 
 import logging
 import os
+import shutil
 import numpy as np
 import torch
 import psutil
@@ -28,6 +29,16 @@ from tqdm import tqdm
 import transforms as T
 
 logger = logging.getLogger(__name__)
+
+# Path to the POSIX shared-memory filesystem used by torch.share_memory_().
+# On macOS and Windows this path does not exist; helpers that reference it
+# degrade gracefully.
+_SHM_PATH = '/dev/shm'
+
+# Preloading stops when free space in /dev/shm falls below this fraction of
+# its total capacity.  The 10 % margin ensures that the last batch written
+# to shared memory can be faulted in without triggering SIGBUS.
+_SHM_MIN_FREE_FRACTION = 0.10
 
 
 class FWIDataset(Dataset):
@@ -54,9 +65,21 @@ class FWIDataset(Dataset):
     Performance notes
     -----------------
     Transforms are applied **once** inside ``_load_chunk`` (not per sample
-    inside ``__getitem__``).  Loaded batches are stored as PyTorch
-    shared-memory tensors so that DataLoader workers can read them via a
-    direct pointer rather than copying data through IPC pipes.
+    inside ``__getitem__``).  Where space permits, loaded batches are stored
+    as PyTorch shared-memory tensors so that DataLoader workers can read them
+    via a direct pointer rather than copying data through IPC pipes.
+
+    SIGBUS / shared-memory safety
+    ------------------------------
+    On Linux, ``torch.Tensor.share_memory_()`` backs tensor storage with a
+    file inside ``/dev/shm`` (a ``tmpfs`` whose size is typically capped at
+    ~50 % of total RAM).  If ``/dev/shm`` fills up and the kernel then tries
+    to fault a page into that ``mmap`` region it delivers **SIGBUS** — a
+    fatal signal that cannot be caught in Python.  To prevent this,
+    ``_to_shared_tensor`` checks free space in ``/dev/shm`` *before* calling
+    ``share_memory_()`` and silently falls back to ordinary process memory
+    when space is insufficient.  ``_preload_until_limit`` stops preloading
+    before ``/dev/shm`` approaches exhaustion for the same reason.
     '''
 
     def __init__(self, anno, preload=True, sample_ratio=1, file_size=500,
@@ -95,10 +118,49 @@ class FWIDataset(Dataset):
         '''Return current RAM usage as a percentage (0-100).'''
         return psutil.virtual_memory().percent
 
+    def _shm_free_bytes(self):
+        '''Return the number of free bytes in the POSIX shared-memory
+        filesystem (``/dev/shm``).
+
+        Returns ``float('inf')`` when ``/dev/shm`` does not exist (macOS,
+        Windows) so that callers treat shared memory as effectively unlimited
+        on those platforms.
+        '''
+        try:
+            return shutil.disk_usage(_SHM_PATH).free
+        except OSError:
+            return float('inf')
+
+    def _to_shared_tensor(self, arr):
+        '''Convert *arr* (a NumPy array) to a contiguous PyTorch tensor and
+        attempt to move it into POSIX shared memory for zero-copy DataLoader
+        worker access.
+
+        The move is skipped when ``/dev/shm`` does not have enough free space
+        for the tensor.  This is the primary defence against **SIGBUS**: on
+        Linux, writing to a ``tmpfs``-backed ``mmap`` region (i.e. shared
+        memory) when the filesystem is full causes the kernel to deliver
+        SIGBUS — a fatal signal that cannot be caught in Python.  By checking
+        free space *before* the call we ensure the tensor either lands safely
+        in shared memory or stays in ordinary process memory.
+        '''
+        t = torch.from_numpy(np.ascontiguousarray(arr))
+        try:
+            if self._shm_free_bytes() >= t.nbytes:
+                t.share_memory_()
+        except Exception:
+            # Defensive catch: if share_memory_() raises for any other reason
+            # (e.g. RLIMIT_MEMLOCK, permission error) we continue with a
+            # regular tensor rather than crashing.
+            pass
+        return t
+
     def _load_chunk(self, batch_idx):
         '''Load one .npy batch from disk, apply transforms once, and return as
-        shared-memory PyTorch tensors.  Transforms are applied here so that
-        DataLoader workers never need to recompute them.'''
+        PyTorch tensors.  Where ``/dev/shm`` has sufficient free space the
+        tensors are placed in shared memory so that DataLoader workers can read
+        them via a direct pointer; otherwise ordinary process memory is used to
+        prevent SIGBUS (see ``_to_shared_tensor``).'''
         batch_line = self.batches[batch_idx]
         parts = [p.strip() for p in batch_line.split('\t')]
         data = np.load(parts[0])[:, :, ::self.sample_ratio, :].astype('float32')
@@ -116,17 +178,44 @@ class FWIDataset(Dataset):
                 lbuf[i] = self.transform_label(label[i])
             label = lbuf
 
-        # Convert to shared-memory tensors: workers read via pointer, no IPC copy.
-        data_t = torch.from_numpy(np.ascontiguousarray(data)).share_memory_()
-        label_t = (torch.from_numpy(np.ascontiguousarray(label)).share_memory_()
-                   if label is not None else None)
+        # Use shared memory only when /dev/shm has room; fall back to regular
+        # tensors to prevent SIGBUS when the shared-memory tmpfs is full.
+        data_t = self._to_shared_tensor(data)
+        label_t = self._to_shared_tensor(label) if label is not None else None
         return data_t, label_t
 
     def _preload_until_limit(self):
-        '''Preload batches sequentially until RAM usage reaches
-        ``memory_limit * 0.95`` percent.'''
+        '''Preload batches sequentially until either:
+
+        * RAM usage reaches ``memory_limit * 0.95`` percent, or
+        * ``/dev/shm`` free space drops below ``_SHM_MIN_FREE_FRACTION`` of
+          its total capacity (default 10 %).
+
+        The second condition prevents SIGBUS: if ``/dev/shm`` fills up while
+        ``_to_shared_tensor`` is copying a batch there, the kernel may deliver
+        SIGBUS before Python can react.  Stopping preload early keeps a safe
+        margin.  Batches that were not preloaded are loaded on demand by
+        ``__getitem__`` using the same guarded ``_to_shared_tensor`` path.
+        '''
+        try:
+            shm_stat = shutil.disk_usage(_SHM_PATH)
+            shm_total = shm_stat.total
+        except OSError:
+            shm_total = 0  # /dev/shm absent (macOS / Windows) – skip that check
+
         for i in tqdm(range(len(self.batches)), desc='Preloading batches'):
             if self._get_mem_usage() >= self.memory_limit * 0.95:
+                break
+            # Guard against /dev/shm exhaustion: stop when free space falls
+            # below _SHM_MIN_FREE_FRACTION of total capacity.  This leaves
+            # headroom for the batches already cached plus whatever the OS needs.
+            if shm_total > 0 and self._shm_free_bytes() < shm_total * _SHM_MIN_FREE_FRACTION:
+                logger.warning(
+                    '/dev/shm is nearly full — stopping preload at batch '
+                    '%d/%d to prevent SIGBUS.  The remaining batches will be '
+                    'loaded on demand.',
+                    i, len(self.batches),
+                )
                 break
             if i not in self.cache_data:
                 data_t, label_t = self._load_chunk(i)
